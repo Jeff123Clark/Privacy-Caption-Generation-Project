@@ -18,7 +18,7 @@ method are not followed.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING
 
 from .graph import METHOD
@@ -138,23 +138,42 @@ def _components(b: "APGBuilder") -> dict[str, tuple[str, str, str, set[str]]]:
     return out
 
 
-def _concrete_types(b: "APGBuilder", d: str, depth: int) -> set[str]:
-    """Classes a definition's value can be an instance of, when the method shows it."""
-    meta = b.stmt_meta.get(d)
-    if meta is None or depth > _MAX_DEPTH:
-        return set()
-    op, regs, type_ref, _, _ = meta
-    if op == "new-instance":
-        return {type_ref} if type_ref else set()
-    if op.startswith("invoke") or op == "check-cast":
-        src = regs[0] if regs else None          # receiver redefined by the call / cast
-    elif op.startswith("move-object"):
-        src = regs[1] if len(regs) > 1 else None
-    else:
-        return set()
+def _concrete_types(b: "APGBuilder", d: str, depth: int = 0) -> set[str]:
+    """Classes a definition's value can be an instance of, when the method shows it.
+
+    Walks back through casts, moves and receiver-redefining calls to `new-instance`, at most
+    _MAX_DEPTH steps. Breadth-first with a visited set: each definition is expanded once (at
+    its smallest depth), so the cost is linear. A plain recursion is exponential when values
+    have several reaching definitions per step, as in large Kotlin/Compose methods.
+    """
+    cache = b.__dict__.setdefault("_concrete_types_cache", {})
+    if depth == 0 and d in cache:
+        return cache[d]
     out: set[str] = set()
-    for e in b.use_defs.get(d, {}).get(src, ()):
-        out |= _concrete_types(b, e, depth + 1)
+    seen = {d}
+    queue = deque([(d, depth)])
+    while queue:
+        x, dx = queue.popleft()
+        meta = b.stmt_meta.get(x)
+        if meta is None or dx > _MAX_DEPTH:
+            continue
+        op, regs, type_ref, _, _ = meta
+        if op == "new-instance":
+            if type_ref:
+                out.add(type_ref)
+            continue
+        if op.startswith("invoke") or op == "check-cast":
+            src = regs[0] if regs else None      # receiver redefined by the call / cast
+        elif op.startswith("move-object"):
+            src = regs[1] if len(regs) > 1 else None
+        else:
+            continue
+        for e in b.use_defs.get(x, {}).get(src, ()):
+            if e not in seen:
+                seen.add(e)
+                queue.append((e, dx + 1))
+    if depth == 0:
+        cache[d] = out
     return out
 
 

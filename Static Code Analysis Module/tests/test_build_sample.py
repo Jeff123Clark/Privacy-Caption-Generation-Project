@@ -150,3 +150,25 @@ def test_constant_arguments_are_properties(apg):
     calls = [s for s in S.values() if s.get("target_name") == "replaceAll"
              and s["method_signature"].endswith("WifiStateChangeService;->setSsid(Landroid/net/wifi/WifiInfo;)V")]
     assert calls and calls[0]["const_args"] == ['1=^"(.*)"$', "2=$1"]
+
+
+def test_streamed_csv_matches_read_csv(apg, tmp_path):
+    """`apg load` streams the CSVs; it must send exactly what read_csv would have built."""
+    from apg.export import csv_app_id, iter_csv
+    write_csv(apg, tmp_path)
+    g2 = read_csv(tmp_path)
+    assert csv_app_id(tmp_path) == apg.app_id
+    nodes, edges = {}, {}
+    for kind, name, rows in iter_csv(tmp_path, batch_size=777):
+        if kind == "nodes":
+            for r in rows:
+                nodes.setdefault(name, {})[r["uid"]] = {k: v for k, v in r.items() if v is not None}
+        else:
+            edges.setdefault(name, []).extend((r["s"], r["e"], r["p"]) for r in rows)
+    assert {k: len(v) for k, v in nodes.items()} == g2.counts()["nodes"]
+    assert {k: len(v) for k, v in edges.items()} == g2.counts()["edges"]
+    for label, bucket in g2.nodes.items():
+        for uid, props in bucket.items():
+            assert nodes[label][uid] == {k: v for k, v in props.items() if v is not None}
+    for rel, lst in g2.edges.items():
+        assert edges[rel] == lst

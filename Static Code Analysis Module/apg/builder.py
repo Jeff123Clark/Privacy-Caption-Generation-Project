@@ -27,7 +27,7 @@ from typing import Any, Iterable
 from . import callbacks, dalvik
 from .controldep import control_dependence
 from .graph import (APG, APP, CLASS, COMPONENT, FIELD, LIBRARY, METHOD, PARAMETER,
-                    PERMISSION, STATEMENT)
+                    PERMISSION, STATEMENT, node_uid)
 from .libraries import OriginClassifier
 
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
@@ -68,6 +68,94 @@ class BuildOptions:
     include_api_permission_mapping: bool = True
     with_source: bool = True    # decompiled Java per method (for PRCS / captions)
     with_tables: bool = True    # per-method AST / CFG / data-flow / call tables as properties
+    # Only analyse classes under these package prefixes (dotted). Everything else in the APK
+    # is treated like an external API: calls into it are kept, its code is not. Needed for
+    # very large APKs (PayPal: 256k classes) that do not fit in memory as a whole.
+    include: tuple[str, ...] = ()
+    # Two-level builds: classes built in the other detail batches (same syntax as include).
+    # Calls into them get ARG edges to their parameters and cross_batch = true, so the
+    # batches can be joined after loading (neo4j_loader.stitch_batches).
+    peers: tuple[str, ...] = ()
+
+
+def _progress(msg: str) -> None:
+    """One line per build phase on stderr, with resident memory, so long builds can be followed."""
+    import sys
+    try:
+        with open("/proc/self/status") as f:
+            rss = next(int(l.split()[1]) for l in f if l.startswith("VmRSS:")) / 1e6
+        mem = f" [{rss:.1f} GB]"
+    except (OSError, StopIteration):
+        mem = ""
+    print(f"[apg] {time.strftime('%H:%M:%S')} {msg}{mem}", file=sys.stderr, flush=True)
+
+
+def include_matcher(entries) -> "callable":
+    """Return keep(dalvik_name) for --include entries (packages or classes, dotted).
+
+    A class entry also keeps its inner classes; a package entry keeps everything below it.
+    """
+    wanted = {e.replace(".", "/") for e in entries}
+
+    def keep(dalvik_name: str) -> bool:
+        name = dalvik_name[1:-1]                      # Lcom/a/B$C; -> com/a/B$C
+        outer = name.split("$", 1)[0]
+        if name in wanted or outer in wanted:
+            return True
+        parts = outer.split("/")
+        return any("/".join(parts[:i]) in wanted for i in range(1, len(parts)))
+
+    return keep
+
+
+def read_entries(items) -> set[str]:
+    """--include / --peers values: comma-separated entries, ``@FILE`` reads one per line."""
+    entries: set[str] = set()
+    for item in items:
+        item = item.strip()
+        if item.startswith("@"):
+            entries |= {ln.strip() for ln in Path(item[1:]).read_text().splitlines() if ln.strip()}
+        elif item:
+            entries.add(item)
+    return entries
+
+
+def analyze_included(apk_path, include: tuple[str, ...]):
+    """Like androguard's AnalyzeAPK, but only for classes under the ``include`` entries.
+
+    Each entry is a package (``com.paypal.oslo.feature.qrc``) or a class
+    (``com.paypal.oslo.feature.qrc.Foo``, which also keeps its inner classes ``Foo$Bar``).
+    An entry ``@FILE`` reads more entries from FILE, one per line.
+    DEX files with no included class are never parsed, and other classes are removed
+    before cross-references are built, so memory scales with the included code only.
+    Calls into the removed classes become external methods, as for framework APIs.
+    """
+    from androguard.core import apk, dex
+    from androguard.core.analysis.analysis import Analysis
+    from androguard.decompiler import decompiler
+
+    entries = read_entries(include)
+    if not entries:
+        raise ValueError("--include is empty")
+    keep = include_matcher(entries)
+    wanted = {e.replace(".", "/") for e in entries}
+    probes = [("L" + w).encode() for w in wanted]
+    a = apk.APK(str(apk_path))
+    d, dx = [], Analysis()
+    for dex_bytes in a.get_all_dex():
+        if len(probes) < 200 and not any(x in dex_bytes for x in probes):
+            continue                                  # quick skip for a few packages
+        df = dex.DEX(dex_bytes, using_api=a.get_target_sdk_version())
+        df.classes.class_def = [c for c in df.classes.class_def if keep(c.get_name())]
+        if not df.classes.class_def:
+            continue
+        dx.add(df)
+        d.append(df)
+        df.set_decompiler(decompiler.DecompilerDAD(df, dx))
+    if not d:
+        raise ValueError(f"no classes in {apk_path} match --include")
+    dx.create_xref()
+    return a, d, dx
 
 
 def class_dots(dalvik_name: str) -> str:
@@ -112,35 +200,46 @@ class APGBuilder:
         self.use_defs: dict[str, dict] = {}       # stmt -> {register: reaching definitions}
         self.registrations: list[tuple] = []      # calls into code without statements
         self.overrides: dict[str, list[str]] = defaultdict(list)
+        peers = read_entries(self.opts.peers)
+        self._is_peer = include_matcher(peers) if peers else (lambda _d: False)
 
     # ------------------------------------------------------------------ public
     def build(self) -> APG:
         t0 = time.time()
         if self._analysis is None:
-            from androguard.misc import AnalyzeAPK
-            self._analysis = AnalyzeAPK(str(self.apk_path))
+            if self.opts.include:
+                self._analysis = analyze_included(self.apk_path, self.opts.include)
+            else:
+                from androguard.misc import AnalyzeAPK
+                self._analysis = AnalyzeAPK(str(self.apk_path))
         self.a, self.d, self.dx = self._analysis
         self.stats["androguard_seconds"] = round(time.time() - t0, 1)
 
         sha = hashlib.sha256(self.apk_path.read_bytes()).hexdigest()
         self.app_id = f"{self.a.get_package()}@{self.a.get_androidversion_code() or 0}-{sha[:8]}"
         self.g = APG(self.app_id)
-        self._u = lambda kind, key: f"{self.app_id}|{kind}|{key}"
+        self._u = lambda kind, key: node_uid(self.app_id, kind, key)
 
         t1 = time.time()
+        _progress(f"androguard done in {self.stats['androguard_seconds']}s")
         self._add_app(sha)
         self._add_manifest()
         self.origins = OriginClassifier(self._app_prefixes())
-        self._add_classes()
-        self._add_methods_and_fields()
-        self._add_bodies()
-        self._link_returns()
-        self._add_overrides_and_entrypoints()
-        callbacks.link(self)
+        steps = [("classes", self._add_classes),
+                 ("methods and fields", self._add_methods_and_fields),
+                 ("statements, CFG and data flow", self._add_bodies),
+                 ("return links", self._link_returns),
+                 ("overrides and entry points", self._add_overrides_and_entrypoints),
+                 ("callbacks and intents", lambda: callbacks.link(self))]
         if self.opts.include_api_permission_mapping:
-            self._add_api_permissions()
+            steps.append(("API permissions", self._add_api_permissions))
         if self.opts.with_tables:
-            self._add_method_tables()
+            steps.append(("per-method tables", self._add_method_tables))
+        for name, step in steps:
+            ts = time.time()
+            _progress(f"{name} ...")
+            step()
+            _progress(f"{name} done in {time.time() - ts:.0f}s")
         self.stats["apg_seconds"] = round(time.time() - t1, 1)
         self.stats.update(self.g.counts())
         return self.g
@@ -243,9 +342,13 @@ class APGBuilder:
         return name
 
     def _app_prefixes(self) -> list[str]:
-        """Package name plus the packages of manifest components that are not SDK classes."""
-        from .libraries import match_library
-        prefixes = {self.a.get_package()}
+        """Package name, the packages of manifest components that are not SDK classes, and
+        the vendor's own SDK prefix when the app belongs to that vendor (PayPal's app
+        com.paypal.android.p2pmobile ships most of its code under com.paypal.*, which is
+        also listed as the PayPal payments SDK)."""
+        from .libraries import vendor_prefixes, match_library
+        package = self.a.get_package()
+        prefixes = {package, *vendor_prefixes(package)}
         for cls in self.component_classes:
             if match_library(cls) is None and "." in cls:
                 prefixes.add(cls.rsplit(".", 1)[0])
@@ -672,6 +775,12 @@ class APGBuilder:
                         g.nodes[STATEMENT][suid]["const_args"] = consts
                     callee_uid, args = call
                     callee_params = {idx: puid for idx, _, puid in self.params.get(callee_uid, [])}
+                    if not callee_params:
+                        callee_cls = self.g.nodes[METHOD][callee_uid]["signature"].split("->", 1)[0]
+                        if self._is_peer(callee_cls) and self.class_info.get(callee_cls, {}).get("external", True):
+                            # Built in another batch: its Parameter nodes use the same uids.
+                            callee_params = {idx: f"{callee_uid}#{idx}" for idx, _ in args}
+                            g.nodes[STATEMENT][suid]["cross_batch"] = True
                     for idx, reg in args:
                         puid = callee_params.get(idx)
                         if puid:

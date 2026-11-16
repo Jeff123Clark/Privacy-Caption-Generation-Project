@@ -66,6 +66,32 @@ KNOWN_LIBRARIES: dict[str, tuple[str, str]] = {
     "com.paypal": ("PayPal", "payments"),
     "com.braintreepayments": ("Braintree", "payments"),
     "com.android.billingclient": ("Google Play Billing", "payments"),
+    "com.plaid": ("Plaid", "payments"),
+    "financial.atomic": ("Atomic Transact", "payments"),
+    "com.knotapi": ("Knot", "payments"),
+    "com.mastercard": ("Mastercard SDK", "payments"),
+    "com.visa": ("Visa SDK", "payments"),
+    "com.discover": ("Discover SDK", "payments"),
+    "com.zettle": ("Zettle", "payments"),
+    "com.izettle": ("Zettle (legacy)", "payments"),
+    "com.ingo": ("Ingo Money", "payments"),
+    "com.payair": ("Payair HCE", "payments"),
+    "com.gemalto.mfs": ("Thales Gemalto Mobile Payments", "payments"),
+    "my.com.softspace": ("Soft Space Tap to Pay", "payments"),
+    # Identity verification (document, card and face scanning)
+    "com.microblink": ("Microblink BlinkID", "identity_verification"),
+    "com.miteksystems": ("Mitek MiSnap", "identity_verification"),
+    "com.facetec": ("FaceTec", "identity_verification"),
+    "com.daon": ("Daon", "identity_verification"),
+    "com.nimbusds": ("Nimbus JOSE+JWT", "crypto"),
+    # Analytics / diagnostics seen in PayPal
+    "com.adobe.marketing": ("Adobe Experience Platform", "analytics"),
+    "com.qualtrics": ("Qualtrics", "analytics"),
+    "com.statsig": ("Statsig", "analytics"),
+    "com.datadog": ("Datadog", "monitoring"),
+    "ai.luciq": ("Luciq (Instabug)", "crash_reporting"),
+    "com.apollographql": ("Apollo GraphQL", "networking"),
+    "com.airbnb.lottie": ("Lottie", "ui"),
     # Cloud / backend
     "com.google.firebase": ("Firebase", "backend"),
     "com.google.android.gms": ("Google Play Services", "backend"),
@@ -131,6 +157,17 @@ def match_library(class_name: str) -> tuple[str, str, str] | None:
         if _has_prefix(class_name, prefix):
             return prefix, lib, cat
     return None
+
+
+def vendor_prefixes(package: str | None) -> list[str]:
+    """SDK prefixes that the app itself belongs to (e.g. "com.paypal" for the PayPal app).
+
+    Code under these prefixes is the developer's own code, not a third-party SDK.
+    Only prefixes with at least two parts count, so "kotlin" or "rx" never match.
+    """
+    if not package:
+        return []
+    return [p for p in KNOWN_LIBRARIES if "." in p and _has_prefix(package, p)]
 
 
 def is_framework(class_name: str) -> bool:

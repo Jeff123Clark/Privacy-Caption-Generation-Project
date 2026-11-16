@@ -119,10 +119,10 @@ ORDER BY method;
 MATCH (g:PPG)-[r:IN_SDK|SHARES_WITH]->(lib:Library)
 RETURN g.method AS method, type(r) AS relation, lib.name AS sdk, lib.category AS category;
 
-// D18. [table] Candidates left out because no entry point reaches them
-MATCH (g:ExcludedPPG)-[:FOR_METHOD]->(m)
+// D18. [table] PPGs with no entry point found (kept, flagged reachable = false)
+MATCH (g:PPG {reachable: false})-[:FOR_METHOD]->(m)
 OPTIONAL MATCH (g)-[b:BECAUSE]->()
-RETURN m.class_name + '.' + m.name AS method, collect(DISTINCT b.data_type) AS data, g.excluded_reason AS reason;
+RETURN m.class_name + '.' + m.name AS method, collect(DISTINCT b.data_type) AS data;
 
 // D19. [table] Checks: all three should be 0
 MATCH (g:PPG)

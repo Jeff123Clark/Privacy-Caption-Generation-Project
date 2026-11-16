@@ -2,3 +2,8 @@
 __pycache__/
 .pytest_cache/
 Static Code Analysis Module/output/
+# Large third-party APKs (only the small sample.apk is tracked)
+Static Code Analysis Module/input/APK/*.apk
+!Static Code Analysis Module/input/APK/sample.apk
+# Windows download markers
+*:Zone.Identifier

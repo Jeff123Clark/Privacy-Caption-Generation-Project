@@ -2,6 +2,9 @@
 
     python scripts/build_ppg.py <app_id> [--export output/ppg]
 
+Text-input fields (P3g, P6g, P6h: asks_for_user_input / receives_user_input) are left out
+by default; --with-user-input adds them back.
+
 Prints what each query did, runs the validation checks, and with --export writes one
 JSON file per PPG (for classification, captions and annotation).
 """
@@ -17,6 +20,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 QUERIES = HERE.parent / "cypher" / "ppg_build.cypher"
+# Queries that find text-input fields and the text typed into them, and the PPG reasons
+# built from them (asks_for_user_input, receives_user_input).
+USER_INPUT_QUERIES = ("P3g.", "P6g.", "P6h.")
 
 
 def split_queries(text: str) -> list[tuple[str, str]]:
@@ -52,8 +58,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("app_id")
     ap.add_argument("--export", help="folder for one JSON file per PPG")
-    ap.add_argument("--wide", action="store_true",
-                    help="also use the Document Analysis Module's source list (more PPGs, needs review)")
+    ap.add_argument("--curated-only", action="store_true",
+                    help="skip the Document Analysis Module's source list (P2b); use only the curated "
+                         "APIs and personal-data names")
+    ap.add_argument("--with-user-input", action="store_true",
+                    help="also make PPGs from text-input fields (asks_for_user_input, "
+                         "receives_user_input); left out by default")
+    ap.add_argument("--wide", action="store_true", help=argparse.SUPPRESS)  # old flag; now the default
     ap.add_argument("--rows", type=int, default=15, help="result rows to print per query")
     ap.add_argument("--neo4j-uri", default=os.environ.get("NEO4J_URI", "bolt://localhost:7687"))
     ap.add_argument("--neo4j-user", default=os.environ.get("NEO4J_USER", "neo4j"))
@@ -65,11 +76,14 @@ def main() -> None:
     from neo4j import GraphDatabase
 
     queries = split_queries(QUERIES.read_text())
-    doc_sources = load_doc_sources() if args.wide else []
-    if not args.wide:
+    doc_sources = [] if args.curated_only else load_doc_sources()
+    if not args.with_user_input:
+        queries = [(t, q) for t, q in queries if not t.startswith(USER_INPUT_QUERIES)]
+        print("Text-input fields are not used (pass --with-user-input to include them)")
+    if args.curated_only:
         queries = [(t, q) for t, q in queries if not t.startswith("P2b.")]
     else:
-        print(f"Wide mode: {len(doc_sources)} categorised sources from the Document Analysis Module")
+        print(f"Using {len(doc_sources)} categorised sources from the Document Analysis Module")
     driver = GraphDatabase.driver(args.neo4j_uri, auth=(args.neo4j_user, args.neo4j_password))
     problems = 0
     export_rows = []

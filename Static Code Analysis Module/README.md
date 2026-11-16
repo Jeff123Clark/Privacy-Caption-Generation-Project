@@ -128,6 +128,81 @@ built for the classes selected with `--stmt-scope`:
 | `all` | every class in the APK | ~1.6M statements, ~70 s build, ~5 GB RAM |
 | `none` | nothing (call graph only) | |
 
+### Very large APKs: the two-level build
+
+Some apps are too large to analyse whole. PayPal 10.18 has 25 dex files and 256k classes,
+154k of them PayPal's own. A full statement-level APG of it does not fit in memory, so large
+APKs are built at two levels of detail:
+
+| Level | What it holds | Covers | Built by |
+|---|---|---|---|
+| 1. Overview | every method, who calls whom, overrides, entry points, SDK membership | **every class in the APK** | `apg/dexscan.py` reads the DEX bytecode directly: PayPal in ~1.5 min, ~2 GB |
+| 2. Detail | the full APG: statements, CFG, data flow, ARG/RETURN | the classes that read a sensitive source, plus the app classes that call them or that they call (up to 2 steps away) | androguard, in batches that each fit in memory |
+
+The overview lets reachability (P7) and SDK detection see the whole app; the detail is where
+the PPGs and their flows are. Detail classes are top-level classes together with their inner
+classes and Kotlin lambdas (`Foo$1`, `Foo$$ExternalSyntheticLambda0`), so a screen and the
+lambda that receives what the user types are built together.
+
+**One command** (APK in, one JSON file per PPG out; the Neo4j password comes from the
+`NEO4J_PASSWORD` environment variable and never appears in the command):
+
+```bash
+export NEO4J_PASSWORD=...            # once per terminal
+../.venv/bin/python -m apg pipeline input/APK/PayPal_10.18.0_APKPure.apk
+```
+
+It runs the five steps below, prints progress, continues where it stopped when rerun, and
+deletes the temporary CSVs after loading (`--keep-files` keeps them). PPG files go to
+`output/ppg/<app_id>/`. Under WSL it first checks free space on Windows C:, where the Linux
+disk file grows, and stops below 15 GB (`--min-free-gb`).
+
+**Size:** node ids are short hashes (`M:3x7q…`, `M:3x7q…@74` for a statement) instead of the
+full app name + signature, and the temporary CSVs are gzip-compressed. On F-Droid the CSVs
+went from 546 MB to 27 MB with the same graph and the same PPGs.
+
+Step by step:
+
+```bash
+APK=input/APK/PayPal_10.18.0_APKPure.apk
+# 1. Seed classes: every class that reads a known sensitive source (curated APIs, Document
+#    Analysis sources, personal-data getters, input fields, privacy-relevant API families)
+../.venv/bin/python scripts/prescan_apk.py $APK --classes-out output/prescan/paypal_source_classes.txt
+# 2. Overview of the whole APK + choice of detail classes, split into batches
+../.venv/bin/python -m apg plan $APK --seeds output/prescan/paypal_source_classes.txt \
+    -o output/twolevel/paypal --batch-units 2000000
+# 3. Build every detail batch, each in its own process (resumable: rerun to continue)
+../.venv/bin/python -m apg build-plan output/twolevel/paypal
+# 4. Load all batches + the overview as one graph, then build the PPGs as usual
+../.venv/bin/python -m apg load output/twolevel/paypal
+../.venv/bin/python scripts/build_ppg.py <app_id> --export output/ppg
+```
+
+- `plan` also adds, as seeds, the app classes that implement `TextWatcher`,
+  `LocationListener` or `LocationCallback` (they receive personal data without calling anything
+  sensitive). Its report is `plan.json` (classes per hop, code size, what the budget left out).
+- **Size control:** `--hops` (default 2) and `--max-units` (default 12M 16-bit code units, about
+  half of PayPal's own code) set how much is built in detail; neighbours with the most links to
+  the seeds are chosen first, and utility classes with more than 50 neighbours are not expanded
+  further. `--batch-units` sets the batch size: 2M uses about 10 GB of memory, 3M about 15 GB.
+  Stop Neo4j while building if memory is short.
+- **Joining the batches:** each batch is built with `--peers` (all detail classes). A call into a
+  class of another batch gets `cross_batch: true` and ARG edges to that method's parameters. After
+  loading, `CALL_FLOW`, `RETURN` and `RETURN_FLOW` for those calls are added in Neo4j
+  (`stitched: true`). Nodes described by several batches are merged: a method's full description
+  wins over the stub other batches have for it.
+- **Check on F-Droid** (`sample.apk`, split into 5 batches on purpose): the same 225 PPGs as a
+  full build, with the same reasons, sinks, flows and reachability.
+- Overview nodes and edges have `level: 'overview'`; methods that have only an overview have no
+  statements (`has_statements` is null), so they never become PPGs on their own unless they call a
+  source API directly (as in a full build's call graph, e.g. an SDK reading location).
+
+The older single-batch route (`apg build --include @classes.txt`) still works but only sees the
+included classes: flows stop where data leaves them and many entry points are missed.
+
+When the app's package sits under a known SDK prefix (`com.paypal.android.p2pmobile` under the
+`com.paypal` "PayPal SDK"), that prefix counts as app code, not as a third-party library.
+
 ## Output files
 
 `output/apg/<app_id>/` contains `nodes_<Label>.csv`, `edges_<TYPE>.csv`, and `apg_summary.json`
@@ -151,8 +226,10 @@ apg/
   dalvik.py        type descriptors, parameter registers, per-opcode def/use rules
   libraries.py     SDK prefix list + app/library/framework/unknown classification
   graph.py         APG container, node labels and relationship catalogue
+  dexscan.py       low-memory DEX reader: whole-app classes, methods and calls
+  overview.py      two-level build: overview (level 1), detail selection and batches (level 2)
   export.py        CSV writer/reader
-  neo4j_loader.py  batched Bolt loader (schema, per-app replace)
+  neo4j_loader.py  batched Bolt loader (schema, per-app replace; joins two-level batches)
   __main__.py      CLI
 cypher/apg_example_queries.cypher   Q1–Q10: building blocks for the PPG
 scripts/run_example_queries.py      runs them with the Document Analysis CSVs as $apis
@@ -161,6 +238,7 @@ cypher/ppg_for_method.cypher        one query for one PPG: is this method's APG 
 cypher/demo_queries.cypher          queries for presenting the APG and PPGs
 cypher/video_demo.cypher            the PPG build split into numbered paste blocks
 scripts/build_ppg.py                runs ppg_build.cypher, validates, exports one JSON per PPG
+scripts/prescan_apk.py              low-memory scan: which packages of a large APK call sensitive APIs
 tests/                              unit tests + sample.apk integration tests
 ```
 
@@ -206,26 +284,50 @@ Classification then labels each PPG.
 NEO4J_PASSWORD=... ../.venv/bin/python scripts/build_ppg.py <app_id> --export output/ppg
 ```
 
+Text-input fields are **not** used by default: no PPG is made just because a method shows a
+text field (`asks_for_user_input`) or receives what the user typed (`receives_user_input`),
+and `input_fields` stays empty. Data the app reads by name (`getCardNumber()`), sensitive APIs
+(location, identifiers), permissions and SDK calls still make PPGs. Add `--with-user-input`
+(to `build_ppg.py` or `apg pipeline`) to include text-input fields (queries P3g, P6g, P6h).
+On F-Droid: 213 PPGs without, 225 with (the 12 extra are input-only screens).
+
+**Confidence.** Each reason has `confidence: high` or `review`. APIs, dangerous permissions
+and callbacks are `high`. Name matches (`handles_personal_data`, e.g. `getAddress()`) start
+as `review`, because a name can mislead (a server URL is also an "address"). Query P12e
+makes one `high` when its class holds **3+ different kinds** of personal data (card number +
+security code + expiry; name + email + phone), or the method reads 3+ kinds by key: a
+record of personal data, in any APK, with no app-specific names. Two more signals are
+recorded in each reason's `evidence` but do not raise confidence, because on F-Droid they
+also hold for URLs: `reaches_sink` (the value leaves the app) and `matching_key` (the same
+kind of data is also used by key). Confidence is metadata for reviewing and choosing
+training data; it never decides what is a PPG.
+
+
 This runs [`cypher/ppg_build.cypher`](cypher/ppg_build.cypher) in order:
 
 | Step | What it does |
 |---|---|
 | P0–P1 | Schema; remove the app's previous PPGs |
-| P2–P3 | Mark source APIs (a fixed list of APIs that *return* personal data) and where the app reads them |
+| P2–P3 | Mark sources and where the app reads them: curated APIs that *return* personal data (P2), the Document Analysis Module's ~6,200 sources (P2b), and personal data read by name from the app's own data models, e.g. `getLastFourDigits()`, `map.get("email")` (P2c, P3e, P3f) |
 | P4–P5 | Mark sinks (logs, URLs, network, files, preferences, databases, Intents, clipboard, screen, SDKs) |
-| P6 | Candidate PPGs: method APGs with a direct reason |
-| P7 | Keep candidates an entry point reaches; others become `ExcludedPPG` |
+| P6 | PPGs: method APGs with a direct reason (sensitive API, dangerous permission, personal-data callback, personal data read by name, call into an analytics or crash-reporting SDK) |
+| P7 | Entry point and call chain for each PPG; PPGs with none found are kept with `reachable: false` |
 | P8–P9 | Privacy flows from each source to its sinks, and the methods each flow passes through |
 | P10–P11 | Link PPGs to their flows and sinks; include the whole method APG; PPG call tree |
 | P12–P13 | Conditions, permissions, SDKs, and the summary used by classification |
 | V1–V4 | Validation (V1, V3, V4 must be 0) |
 | E | Export: one JSON per PPG, including the method's tables and Java |
 
-**Wide mode:** `build_ppg.py <app_id> --wide` also uses the Document Analysis Module's ~6,200
-categorised sources. PPGs found only that way get `confidence: 'review'`. On F-Droid it adds 41
-reachable PPGs, almost all of them noise (e.g. `Calendar.getInstance` counted as calendar data,
-`ClassLoader.loadClass` as network data), so it is a tool for finding candidates to add to the
-curated list, not for final results.
+**Extraction, not classification.** These queries find every method APG that touches data from a
+known sensitive source. They do not decide what kind of data it is or how it is used; that is the
+ML model's job. The source lists' own categories are exported only under `heuristic_hints`, marked
+as not-for-training.
+
+**Sources:** the Document Analysis Module's ~6,200 categorised sources are used by default
+(`--curated-only` turns them off). PPGs found only that way get `confidence: 'review'`. They
+include some APIs that are not personal data: on F-Droid they added 41 PPGs, many of them noise
+(e.g. `Calendar.getInstance`, `ClassLoader.loadClass`). Personal data found by name also gets
+`confidence: 'review'`.
 
 **One query for one PPG:** [`cypher/ppg_for_method.cypher`](cypher/ppg_for_method.cypher) takes one
 method and returns whether its APG is a PPG, why, its categories, where its data goes, which other

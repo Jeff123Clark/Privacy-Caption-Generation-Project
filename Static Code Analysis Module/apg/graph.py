@@ -89,3 +89,18 @@ class APG:
             "nodes": {k: len(v) for k, v in self.nodes.items()},
             "edges": {k: len(v) for k, v in self.edges.items()},
         }
+
+
+def node_uid(app_id: str, kind: str, key: str) -> str:
+    """Short, stable node id: kind + 16-character hash of (app, kind, key).
+
+    The same key always gives the same id, so detail batches and the overview built in
+    separate processes agree on ids. The full key stays readable in node properties
+    (signature, name, method_signature ...). Statements and parameters append their offset
+    or index to their method's id: ``M:abcd...@74``, ``M:abcd...#1``.
+    """
+    import base64
+    import hashlib
+    h = hashlib.blake2b(f"{app_id}|{kind}|{key}".encode(), digest_size=10).digest()
+    return f"{kind}:{base64.b32encode(h).decode().lower()}"
+

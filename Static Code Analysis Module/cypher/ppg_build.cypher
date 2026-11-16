@@ -23,7 +23,10 @@
 // Precision rules (to avoid false positives):
 //   * Sources are a fixed list of APIs that RETURN personal data (not "is Wi-Fi on?").
 //   * Only dangerous (runtime) permissions count as a reason.
-//   * A PPG must be reachable from an entry point; unreachable ones become ExcludedPPG.
+//   * Every candidate is kept. PPGs no entry point is found for are flagged
+//     (reachable = false), not dropped: Kotlin, DI and partial (--include) builds hide callers.
+//   * These queries EXTRACT PPGs; they do not classify them. Data categories are the ML
+//     model's job. The source lists' own categories are exported only as heuristic_hints.
 //   * Data must reach a specific argument of a sink, and may not pass through calls that
 //     turn it into a yes/no or a number about it (isEmpty, equals, length ...).
 //   * Every element is an existing APG node and every evidence step an existing APG edge.
@@ -58,6 +61,13 @@ MATCH (n:APG {app_id: $app}) WHERE n:SourcePoint OR n:SinkPoint OR n:SourceAPI O
 REMOVE n:SourcePoint, n:SinkPoint, n:SourceAPI, n:SinkAPI,
        n.source_category, n.data_type, n.source_list, n.sink_kind, n.sink_args, n.sink_detail;
 
+MATCH (k:PrivacyKeyword {app_id: $app}) DELETE k;
+
+MATCH (:APG {app_id: $app})-[t:TYPED_INTO]->() DELETE t;
+
+MATCH (i:InputField {app_id: $app})
+REMOVE i:InputField, i.input_component, i.input_labels, i.input_keyboard, i.input_screen_strings;
+
 
 // -----------------------------------------------------------------------------
 // P2. Source APIs: Android/SDK methods that RETURN personal data.
@@ -72,6 +82,8 @@ UNWIND [
   {c:'android.location.Location', m:'getAltitude', cat:'LOCATION_INFORMATION', d:'altitude'},
   {c:'com.google.android.gms.location.FusedLocationProviderClient', m:'getLastLocation', cat:'LOCATION_INFORMATION', d:'device location'},
   {c:'com.google.android.gms.location.FusedLocationProviderClient', m:'getCurrentLocation', cat:'LOCATION_INFORMATION', d:'device location'},
+  {c:'android.location.Geocoder', m:'getFromLocation', cat:'LOCATION_INFORMATION', d:'street address of a location'},
+  {c:'android.location.Geocoder', m:'getFromLocationName', cat:'LOCATION_INFORMATION', d:'location of an address'},
   {c:'android.net.wifi.WifiManager', m:'getScanResults', cat:'LOCATION_INFORMATION', d:'nearby Wi-Fi networks'},
   // Device and advertising identifiers
   {c:'android.telephony.TelephonyManager', m:'getDeviceId', cat:'UNIQUE_IDENTIFIER', d:'IMEI/MEID'},
@@ -117,11 +129,66 @@ ORDER BY category, api;
 
 
 // -----------------------------------------------------------------------------
-// P2b. WIDE MODE ONLY (python scripts/build_ppg.py <app_id> --wide): add the Document
-//      Analysis Module's categorised sources (formatted_sources.csv, passed in as
-//      $doc_sources). They are broader than the curated list above and include APIs
-//      that are not personal data, so PPGs found only through them get confidence
-//      'review'. Skip this query when running the file by hand.
+// P2c. Personal-data names. Data the user types in or the app's servers send back
+//      (card numbers, names, dates of birth ...) never comes from an Android API, so it
+//      is found by name: getters like getLastFourDigits() (P3f) and keys like
+//      map.get("email") (P3e). Names are compared lower-case without _ or -; a keyword
+//      matches the whole name or its end ("billingAddress" -> address). Keywords of 4
+//      letters or fewer must match the whole name. Matches get confidence 'review'
+//      (raised to 'high' by corroborating evidence, P12e).
+//      The category column only groups the list; it is exported as a hint, not a label.
+// -----------------------------------------------------------------------------
+UNWIND [
+  // Financial Information
+  ['FINANCIAL_INFORMATION', 'card number', ['cardnumber', 'pan', 'primaryaccountnumber']],
+  ['FINANCIAL_INFORMATION', 'card security code', ['cvv', 'cvc', 'cvv2', 'securitycode', 'cardsecuritycode']],
+  ['FINANCIAL_INFORMATION', 'card expiry date', ['expirydate', 'expirationdate', 'expirymonth', 'expiryyear', 'expmonth', 'expyear', 'expirationmonth', 'expirationyear']],
+  ['FINANCIAL_INFORMATION', 'cardholder name', ['cardholdername', 'nameoncard']],
+  ['FINANCIAL_INFORMATION', 'last digits of a card or account', ['last4', 'lastfour', 'lastfourdigits', 'lastdigits']],
+  ['FINANCIAL_INFORMATION', 'card type', ['cardbrand', 'cardtype', 'cardnetwork', 'cardissuer']],
+  ['FINANCIAL_INFORMATION', 'bank account number', ['accountnumber', 'bankaccountnumber', 'iban']],
+  ['FINANCIAL_INFORMATION', 'bank routing code', ['routingnumber', 'sortcode', 'swiftcode', 'bic']],
+  ['FINANCIAL_INFORMATION', 'bank name', ['bankname']],
+  ['FINANCIAL_INFORMATION', 'account balance', ['balance', 'availablebalance']],
+  ['FINANCIAL_INFORMATION', 'payment amount', ['amount']],
+  ['FINANCIAL_INFORMATION', 'income or credit', ['salary', 'income', 'annualincome', 'creditlimit', 'creditscore']],
+  ['FINANCIAL_INFORMATION', 'employer', ['employer', 'employername']],
+  // Personally Identifying Information
+  ['PERSONAL_IDENTIFIER', 'name', ['firstname', 'lastname', 'fullname', 'givenname', 'familyname', 'middlename', 'displayname', 'legalname']],
+  ['PERSONAL_IDENTIFIER', 'email address', ['email', 'emailaddress']],
+  ['PERSONAL_IDENTIFIER', 'phone number', ['phone', 'phonenumber', 'mobilenumber']],
+  ['PERSONAL_IDENTIFIER', 'postal address', ['address', 'streetaddress', 'addressline1', 'addressline2', 'homeaddress']],
+  ['PERSONAL_IDENTIFIER', 'username', ['username']],
+  ['PERSONAL_IDENTIFIER', 'account ID', ['userid', 'accountid', 'payerid', 'customerid']],
+  ['PERSONAL_IDENTIFIER', 'government ID number', ['ssn', 'socialsecuritynumber', 'taxid', 'nationalid', 'passportnumber', 'driverslicensenumber']],
+  // Demographic Information
+  ['DEMOGRAPHIC_INFORMATION', 'date of birth', ['dateofbirth', 'birthdate', 'dob']],
+  ['DEMOGRAPHIC_INFORMATION', 'gender', ['gender', 'sex']],
+  ['DEMOGRAPHIC_INFORMATION', 'age', ['age']],
+  ['DEMOGRAPHIC_INFORMATION', 'nationality', ['nationality', 'citizenship']],
+  ['DEMOGRAPHIC_INFORMATION', 'ethnicity', ['ethnicity', 'race']],
+  ['DEMOGRAPHIC_INFORMATION', 'religion', ['religion']],
+  ['DEMOGRAPHIC_INFORMATION', 'marital status', ['maritalstatus']],
+  // Location Information
+  ['LOCATION_INFORMATION', 'latitude', ['latitude', 'lat']],
+  ['LOCATION_INFORMATION', 'longitude', ['longitude', 'lng', 'lon']],
+  ['LOCATION_INFORMATION', 'city', ['city']],
+  ['LOCATION_INFORMATION', 'postal code', ['postalcode', 'zipcode', 'postcode']],
+  ['LOCATION_INFORMATION', 'country', ['country', 'countrycode']],
+  // Medical Information
+  ['HEALTH_INFORMATION', 'health data', ['heartrate', 'bloodpressure', 'bloodsugar', 'bloodglucose', 'stepcount', 'diagnosis', 'medication']]
+] AS row
+UNWIND row[2] AS kw
+CREATE (:PrivacyKeyword {app_id: $app, kw: kw, category: row[0], data_type: row[1], exact: size(kw) <= 4})
+RETURN row[0] AS category, count(*) AS keywords ORDER BY category;
+
+
+// -----------------------------------------------------------------------------
+// P2b. The Document Analysis Module's categorised sources (formatted_sources.csv, about
+//      6,200 APIs, passed in as $doc_sources by build_ppg.py; --curated-only skips them).
+//      They are broader than the curated list above and include some APIs that are not
+//      personal data, so PPGs found only through them get confidence 'review'.
+//      When running this file by hand, skip this query or pass $doc_sources = [].
 // -----------------------------------------------------------------------------
 UNWIND $doc_sources AS s
 MATCH (m:Method {app_id: $app, class_name: s.class_name, name: s.method_name})
@@ -171,6 +238,154 @@ MATCH (m)-[:HAS_PARAM]->(p:Parameter {index: 1})
 SET p:SourcePoint, p.source_category = 'LOCATION_INFORMATION', p.data_type = 'device location'
 RETURN count(p) AS location_callbacks;
 
+// P3e. Keyed reads and writes whose key is a personal-data name:
+//      map.get("email"), json.optString("cardNumber"), intent.putExtra("dob", x) ...
+//      The key is the call's first argument after the object (const_args '1=<key>').
+MATCH (k:PrivacyKeyword {app_id: $app})
+WITH collect(k) AS kws
+MATCH (q:Statement {app_id: $app, kind: 'invoke'})
+WHERE q.target_class IN ['java.util.Map', 'java.util.HashMap', 'java.util.LinkedHashMap', 'java.util.TreeMap',
+                         'org.json.JSONObject', 'com.google.gson.JsonObject', 'android.os.Bundle',
+                         'android.os.BaseBundle', 'android.content.Intent', 'android.content.SharedPreferences']
+  AND (q.target_name IN ['get', 'opt', 'add', 'addProperty'] OR q.target_name STARTS WITH 'get'
+       OR q.target_name STARTS WITH 'opt' OR q.target_name STARTS WITH 'put')
+  AND q.const_args IS NOT NULL AND NOT q:SourcePoint
+WITH q, kws, [a IN q.const_args WHERE a STARTS WITH '1=' | substring(a, 2)][0] AS key
+WHERE key IS NOT NULL AND size(key) < 40
+WITH q, kws, key, reduce(n = '', c IN split(toLower(key), '') | CASE WHEN c =~ '[a-z0-9]' THEN n + c ELSE n END) AS norm
+WITH q, key, [k IN kws WHERE norm = k.kw OR (NOT k.exact AND norm ENDS WITH k.kw)] AS hits
+WHERE size(hits) > 0
+WITH q, key, reduce(best = hits[0], k IN hits | CASE WHEN size(k.kw) > size(best.kw) THEN k ELSE best END) AS k
+SET q:SourcePoint, q.source_category = k.category, q.source_list = 'name_match',
+    q.data_type = k.data_type + ' (key "' + key + '")'
+RETURN k.category AS category, q.target_class + '.' + q.target_name AS api, count(q) AS call_sites
+ORDER BY category, api;
+
+// P3f. Getter calls on the app's or an SDK's data models whose name is a personal-data
+//      name: card.getLastFourDigits(), user.getEmail(), location.getLatitude() ...
+//      No-argument getters only, not yes/no ones; framework and runtime classes skipped.
+MATCH (k:PrivacyKeyword {app_id: $app})
+WITH collect(k) AS kws
+MATCH (q:Statement {app_id: $app, kind: 'invoke'})
+WHERE q.target_name STARTS WITH 'get' AND size(q.target_name) > 4 AND NOT q:SourcePoint
+  AND q.target_java_signature ENDS WITH '()>'
+  AND NOT q.target_java_signature CONTAINS ': boolean ' AND NOT q.target_java_signature CONTAINS ': void '
+  AND NOT any(p IN ['android.', 'java.', 'javax.', 'dalvik.', 'kotlin.', 'kotlinx.', 'androidx.',
+                    'com.google.android.material.', 'org.json.']
+              WHERE q.target_class STARTS WITH p)
+WITH q, kws, reduce(n = '', c IN split(toLower(substring(q.target_name, 3)), '') |
+                    CASE WHEN c =~ '[a-z0-9]' THEN n + c ELSE n END) AS norm
+WITH q, [k IN kws WHERE norm = k.kw OR (NOT k.exact AND norm ENDS WITH k.kw)] AS hits
+WHERE size(hits) > 0
+WITH q, reduce(best = hits[0], k IN hits | CASE WHEN size(k.kw) > size(best.kw) THEN k ELSE best END) AS k
+WITH q, k, split(q.target_class, '.') AS parts
+SET q:SourcePoint, q.source_category = k.category, q.source_list = 'name_match',
+    q.data_type = k.data_type + ' (' + parts[size(parts) - 1] + '.' + q.target_name + ')'
+RETURN k.category AS category, k.data_type AS data, count(q) AS call_sites
+ORDER BY category, data;
+
+
+// -----------------------------------------------------------------------------
+// P3g. User input: where the app asks the user to type, and where the typed text arrives.
+// -----------------------------------------------------------------------------
+// P3g-1. Input fields: calls to a text-input component, the framework's (TextField,
+//        OutlinedTextField, BasicTextField) or the app's own design system (TextInput,
+//        PasswordInput, CodeInput, PinInput, OtpInput; Compose may append -<hash>).
+//        Each gets what identifies it, from the APG: the string resources used as its
+//        label (R$string field reads flowing into the call, or read inside the label /
+//        placeholder lambdas passed to it), its keyboard type
+//        (KeyboardType.Number, .Password ...), and, when no label flows in, the screen's
+//        other strings. Wrappers that implement such a component are skipped.
+MATCH (m:Method {app_id: $app})-[:HAS_STATEMENT]->(i:Statement {kind: 'invoke'})
+WHERE i.target_name =~ '^((Basic|Outlined)?TextField|\\w*TextInput|PasswordInput|CodeInput|PinInput|OtpInput)(-\\w+)?$'
+  AND NOT m.name =~ '^((Basic|Outlined)?TextField|\\w*TextInput|PasswordInput|CodeInput|PinInput|OtpInput)(-\\w+)?$'
+OPTIONAL CALL (i) {
+  MATCH (f:Field)-[:READ_BY]->(:Statement)-[:DATA_DEP*1..4]->(i)
+  WHERE f.class_name ENDS WITH 'R$string'
+  RETURN collect(DISTINCT f.name) AS labels
+}
+OPTIONAL CALL (i) {
+  // Compose labels are often lambdas of their own: label = { Text(stringResource(R.string.x)) }.
+  // Strings read inside the lambdas passed to the field (label, placeholder, hint).
+  MATCH (n:Statement {kind: 'new_instance'})-[:DATA_DEP*1..4]->(i)
+  WHERE n.type_ref IS NOT NULL
+  WITH DISTINCT replace(substring(n.type_ref, 1, size(n.type_ref) - 2), '/', '.') AS lc
+  MATCH (:Method {class_name: lc})-[:HAS_STATEMENT]->(:Statement)<-[:READ_BY]-(f:Field)
+  WHERE f.class_name ENDS WITH 'R$string'
+  RETURN collect(DISTINCT f.name) AS lambda_labels
+}
+OPTIONAL CALL (i) {
+  MATCH (k:Statement {kind: 'invoke'})-[:DATA_DEP*1..5]->(i)
+  WHERE k.target_class = 'androidx.compose.ui.text.input.KeyboardType$Companion' AND k.target_name STARTS WITH 'get'
+  RETURN collect(DISTINCT split(substring(k.target_name, 3), '-')[0]) AS keyboard
+}
+OPTIONAL CALL (m) {
+  MATCH (m)-[:HAS_STATEMENT]->(r:Statement)<-[:READ_BY]-(f:Field)
+  WHERE f.class_name ENDS WITH 'R$string'
+  RETURN collect(DISTINCT f.name)[..15] AS screen_strings
+}
+WITH i, keyboard, screen_strings,
+     labels + [l IN lambda_labels WHERE NOT l IN labels] AS labels
+SET i:InputField,
+    i.input_component = split(i.target_name, '-')[0],
+    i.input_labels = labels,
+    i.input_keyboard = keyboard,
+    i.input_screen_strings = CASE WHEN size(labels) = 0 THEN screen_strings ELSE [] END
+RETURN i.input_component AS component, count(i) AS fields,
+       count(CASE WHEN size(labels) > 0 THEN 1 END) AS with_label,
+       count(CASE WHEN size(keyboard) > 0 THEN 1 END) AS with_keyboard
+ORDER BY fields DESC;
+
+// P3g-2. Typed text, through the field's onValueChange handler: the lambda passed as the
+//        call's second argument (uses[1]); its invoke() receives what the user typed.
+//        The lambda is a new object (new-instance) or a singleton (static INSTANCE field).
+MATCH (i:InputField {app_id: $app})
+WHERE size(i.uses) > 1
+CALL (i) {
+  MATCH p = (n:Statement {kind: 'new_instance'})-[:DATA_DEP*1..4]->(i)
+  WHERE last(relationships(p)).reg = i.uses[1] AND n.type_ref IS NOT NULL
+  RETURN replace(substring(n.type_ref, 1, size(n.type_ref) - 2), '/', '.') AS lambda_class
+  UNION
+  MATCH p = (f:Field {name: 'INSTANCE'})-[:READ_BY]->(:Statement)-[:DATA_DEP*1..3]->(i)
+  WHERE last(relationships(p)).reg = i.uses[1]
+  RETURN f.class_name AS lambda_class
+}
+MATCH (cb:Method {app_id: $app, class_name: lambda_class, name: 'invoke'})-[:HAS_PARAM]->(p:Parameter {index: 1})
+WHERE cb.param_count = 1
+MERGE (p)-[:TYPED_INTO]->(i)
+SET p:SourcePoint, p.source_category = 'USER_INPUT', p.source_list = 'user_input',
+    p.data_type = 'text typed into ' + i.input_component +
+                  CASE WHEN size(i.input_labels) > 0 THEN ' (' + reduce(t = '', l IN i.input_labels | t + l + ' ') + ')' ELSE '' END
+RETURN i.input_component AS component, count(DISTINCT p) AS handlers;
+
+// P3g-3. Typed text read back from the field's state: TextFieldState.getText(),
+//        TextFieldValue.getText(), EditText.getText(), Editable from a TextWatcher.
+//        Linked to its field when the same state object also flows into the field.
+MATCH (q:Statement {app_id: $app, kind: 'invoke'})
+WHERE NOT q:SourcePoint AND (
+      (q.target_class IN ['androidx.compose.foundation.text.input.TextFieldState',
+                          'androidx.compose.ui.text.input.TextFieldValue',
+                          'android.widget.EditText'] AND q.target_name = 'getText')
+   OR (q.target_class = 'androidx.compose.foundation.text.input.TextFieldState' AND q.target_name = 'getValue'))
+OPTIONAL MATCH (d:Statement)-[r1:DATA_DEP]->(q) WHERE r1.reg = q.uses[0]
+OPTIONAL MATCH (d)-[:DATA_DEP*1..3]->(i:InputField)
+WITH q, collect(DISTINCT i) AS fields
+FOREACH (i IN fields | MERGE (q)-[:TYPED_INTO]->(i))
+SET q:SourcePoint, q.source_category = 'USER_INPUT', q.source_list = 'user_input',
+    q.data_type = 'text typed by the user (' + split(q.target_class, '.')[-1] + '.getText)' +
+      CASE WHEN size(fields) > 0 AND size(fields[0].input_labels) > 0
+           THEN ' (' + reduce(t = '', l IN fields[0].input_labels | t + l + ' ') + ')' ELSE '' END
+RETURN q.target_class AS api, count(q) AS reads, count(CASE WHEN size(fields) > 0 THEN 1 END) AS linked_to_field;
+
+// P3g-4. TextWatcher callbacks: the Editable / CharSequence the user is typing.
+MATCH (m:Method {app_id: $app})-[:OVERRIDES]->(api:Method)
+WHERE api.class_name = 'android.text.TextWatcher' AND api.name IN ['afterTextChanged', 'onTextChanged']
+MATCH (m)-[:HAS_PARAM]->(p:Parameter {index: 1})
+WHERE NOT p:SourcePoint
+SET p:SourcePoint, p.source_category = 'USER_INPUT', p.source_list = 'user_input',
+    p.data_type = 'text typed by the user (TextWatcher.' + api.name + ')'
+RETURN count(p) AS text_watchers;
+
 
 // -----------------------------------------------------------------------------
 // P4. Sink APIs: where data is stored, logged, shown, sent or shared.
@@ -216,6 +431,15 @@ SET m:SinkAPI, m.sink_kind = spec.k, m.sink_args = spec.a, m.sink_detail = spec.
 RETURN spec.k AS kind, spec.c AS class, collect(DISTINCT name) AS methods, count(m) AS in_apg
 ORDER BY kind, class;
 
+// P4a. Jetpack Compose text on screen: Text(text, ...) / BasicText(text, ...). Kotlin
+//      mangles the names (Text--4IGK_g), so match the start. The text is the first argument.
+MATCH (m:Method {app_id: $app})
+WHERE m.class_name IN ['androidx.compose.material3.TextKt', 'androidx.compose.material.TextKt',
+                       'androidx.compose.foundation.text.BasicTextKt']
+  AND (m.name STARTS WITH 'Text' OR m.name STARTS WITH 'BasicText')
+SET m:SinkAPI, m.sink_kind = 'ui_display', m.sink_args = [0], m.sink_detail = 'text on screen (Compose)'
+RETURN m.class_name AS class, count(m) AS overloads;
+
 // P4b. Sink points: calls to sink APIs
 MATCH (t:Statement {app_id: $app, kind: 'invoke'})-[:INVOKES]->(api:SinkAPI)
 SET t:SinkPoint, t.sink_kind = api.sink_kind, t.sink_args = api.sink_args, t.sink_detail = api.sink_detail
@@ -227,7 +451,7 @@ RETURN t.sink_kind AS kind, count(t) AS call_sites ORDER BY kind;
 MATCH (t:Statement {app_id: $app, kind: 'invoke'})-[:INVOKES]->(api:Method {origin: 'library'})
 MATCH (api)<-[:HAS_METHOD]-(:Class)-[:BELONGS_TO]->(lib:Library)
 WHERE lib.category IN ['analytics', 'attribution', 'advertising', 'crash_reporting', 'monitoring',
-                       'social', 'authentication', 'push_messaging', 'backend', 'payments',
+                       'social', 'authentication', 'push_messaging', 'backend', 'payments', 'identity_verification',
                        'location', 'networking', 'logging']
   AND lib.name <> 'Okio'
   AND NOT t:SinkPoint
@@ -279,7 +503,7 @@ ORDER BY category, data;
 
 // P6b. Reason calls_sensitive_api, special cases proven from arguments (android_id, provider URIs)
 MATCH (m:Method {app_id: $app})-[:HAS_STATEMENT]->(s:SourcePoint)
-WHERE NOT exists { (s)-[:INVOKES]->(:SourceAPI) }
+WHERE NOT exists { (s)-[:INVOKES]->(:SourceAPI) } AND NOT coalesce(s.source_list, '') IN ['name_match', 'user_input']
 MERGE (g:PPG {ppg_id: $app + '|PPG|' + m.signature})
 SET g.app_id = $app
 MERGE (g)-[:FOR_METHOD]->(m)
@@ -290,6 +514,7 @@ RETURN s.data_type AS data, count(DISTINCT m) AS methods;
 
 // P6c. Reason receives_personal_data: callback parameters that carry personal data (Location)
 MATCH (m:Method {app_id: $app})-[:HAS_PARAM]->(p:Parameter:SourcePoint)
+WHERE coalesce(p.source_list, '') <> 'user_input'
 MERGE (g:PPG {ppg_id: $app + '|PPG|' + m.signature})
 SET g.app_id = $app
 MERGE (g)-[:FOR_METHOD]->(m)
@@ -342,8 +567,67 @@ SET b.category = d.cat, b.data_type = perm.name, b.detail = apis, b.confidence =
 RETURN perm.name AS permission, count(DISTINCT m) AS methods;
 
 
+// P6e. Reason handles_personal_data: the method reads personal data by name (P3e, P3f):
+//      card details, names, email, date of birth ... from the app's own data models.
+MATCH (m:Method {app_id: $app, is_external: false})-[:HAS_STATEMENT]->(s:SourcePoint {source_list: 'name_match'})
+MERGE (g:PPG {ppg_id: $app + '|PPG|' + m.signature})
+SET g.app_id = $app
+MERGE (g)-[:FOR_METHOD]->(m)
+MERGE (g)-[b:BECAUSE {reason: 'handles_personal_data'}]->(s)
+SET b.category = s.source_category, b.data_type = s.data_type,
+    b.detail = s.target_java_signature, b.source_list = 'name_match', b.confidence = 'review'
+RETURN s.source_category AS category, count(DISTINCT m) AS methods
+ORDER BY category;
+
+// P6f. Reason reports_to_sdk: the method calls an analytics / ads SDK (App analytics:
+//      usage data) or a crash-reporting / monitoring SDK (Diagnostics).
+MATCH (m:Method {app_id: $app, is_external: false})-[:HAS_STATEMENT]->(t:Statement {kind: 'invoke'})
+      -[:INVOKES]->(api:Method)<-[:HAS_METHOD]-(:Class)-[:BELONGS_TO]->(lib:Library)
+WHERE lib.category IN ['analytics', 'attribution', 'advertising', 'crash_reporting', 'monitoring']
+WITH m, lib, CASE WHEN lib.category IN ['crash_reporting', 'monitoring'] THEN 'DIAGNOSTICS' ELSE 'APP_ANALYTICS' END AS cat,
+     collect(DISTINCT api.java_signature) AS apis, count(t) AS calls
+MERGE (g:PPG {ppg_id: $app + '|PPG|' + m.signature})
+SET g.app_id = $app
+MERGE (g)-[:FOR_METHOD]->(m)
+MERGE (g)-[b:BECAUSE {reason: 'reports_to_sdk'}]->(lib)
+SET b.category = cat,
+    b.data_type = CASE cat WHEN 'DIAGNOSTICS' THEN 'diagnostics sent to ' ELSE 'usage data sent to ' END + lib.name,
+    b.detail = apis[..10], b.call_sites = calls, b.confidence = 'review'
+RETURN cat AS category, lib.name AS sdk, count(DISTINCT m) AS methods
+ORDER BY category, sdk;
+
+
+// P6g. Reason asks_for_user_input: the method shows a text-input field (P3g-1). The
+//      field's component, labels and keyboard type are the evidence of what is asked.
+MATCH (m:Method {app_id: $app, is_external: false})-[:HAS_STATEMENT]->(i:InputField)
+MERGE (g:PPG {ppg_id: $app + '|PPG|' + m.signature})
+SET g.app_id = $app
+MERGE (g)-[:FOR_METHOD]->(m)
+MERGE (g)-[b:BECAUSE {reason: 'asks_for_user_input'}]->(i)
+SET b.category = 'USER_INPUT', b.source_list = 'user_input', b.confidence = 'high',
+    b.data_type = 'asks the user to type into ' + i.input_component,
+    b.detail = i.input_component, b.input_labels = i.input_labels,
+    b.input_keyboard = i.input_keyboard, b.input_screen_strings = i.input_screen_strings
+RETURN count(DISTINCT m) AS methods, count(i) AS fields;
+
+// P6h. Reason receives_user_input: the method gets the text the user typed (P3g-2..4).
+MATCH (m:Method {app_id: $app, is_external: false})-[:HAS_STATEMENT|HAS_PARAM]->(s:SourcePoint {source_list: 'user_input'})
+OPTIONAL MATCH (s)-[:TYPED_INTO]->(i:InputField)
+WITH m, s, collect(i)[0] AS i
+MERGE (g:PPG {ppg_id: $app + '|PPG|' + m.signature})
+SET g.app_id = $app
+MERGE (g)-[:FOR_METHOD]->(m)
+MERGE (g)-[b:BECAUSE {reason: 'receives_user_input'}]->(s)
+SET b.category = 'USER_INPUT', b.source_list = 'user_input', b.confidence = 'high',
+    b.data_type = s.data_type, b.detail = coalesce(s.target_java_signature, 'parameter of ' + m.name),
+    b.input_labels = CASE WHEN i IS NULL THEN [] ELSE i.input_labels END,
+    b.input_keyboard = CASE WHEN i IS NULL THEN [] ELSE i.input_keyboard END
+RETURN count(DISTINCT m) AS methods;
+
+
 // -----------------------------------------------------------------------------
-// P7. Keep only PPGs an entry point can reach (others become ExcludedPPG, see V2).
+// P7. Entry points: the shortest call chain from an entry point to each PPG. PPGs with
+//     none found stay PPGs with reachable = false (see V2); they are not dropped.
 //     A method is also reached when code calls the app interface/parent method it
 //     overrides (virtual dispatch).
 // -----------------------------------------------------------------------------
@@ -356,8 +640,7 @@ OPTIONAL CALL (m) {
   ORDER BY hops LIMIT 1
 }
 WITH g, e, chain, hops
-FOREACH (_ IN CASE WHEN e IS NULL THEN [1] ELSE [] END |
-  REMOVE g:PPG SET g:ExcludedPPG, g.excluded_reason = 'not reachable from any entry point')
+SET g.reachable = e IS NOT NULL
 FOREACH (_ IN CASE WHEN e IS NULL THEN [] ELSE [1] END |
   SET g.entrypoint = e.class_name + '.' + e.name,
       g.entrypoint_kind = coalesce(e.entrypoint_kind, 'class_init'),
@@ -392,6 +675,7 @@ SET f.app_id = $app,
     f.category = src.source_category, f.data_type = src.data_type,
     f.kind = t.sink_kind, f.detail = t.sink_detail, f.api = t.target_java_signature,
     f.source_method = m.class_name + '.' + m.name,
+    f.source = coalesce(src.target_java_signature, src.code, 'parameter ' + toString(src.index) + ' of ' + m.name),
     f.hops = length(p), f.field_hops = field_hops,
     f.confidence = CASE WHEN field_hops = 0 AND callback_hops = 0 THEN 'high' ELSE 'medium' END,
     f.path = [n IN nodes(p) | n.uid],
@@ -485,6 +769,55 @@ RETURN count(g) AS ppgs;
 
 
 // -----------------------------------------------------------------------------
+// P12e. Evidence for name matches (handles_personal_data). A name like getAddress() may
+//       not be personal data (a web address), so these start at confidence 'review'.
+//       Evidence recorded for each (works for any APK: no app- or vendor-specific names):
+//         several_fields  the class holds 3+ DIFFERENT kinds of personal data (card
+//                         number + security code + expiry date; name + email + birth
+//                         date), or the method reads 3+ different kinds by key. A record
+//                         of personal data, not one word that happens to match.
+//         reaches_sink    the value flows out of the app: network, SDK, URL, other apps,
+//                         clipboard (being shown on screen does not count)
+//         matching_key    the same kind of data is also read or written by key elsewhere
+//       Only several_fields makes a reason 'high'. Tested on F-Droid, the other two also
+//       hold for URLs and IP addresses named getAddress() (a URL is sent to the network,
+//       "address" keys are everywhere), so they are kept as evidence, not as proof.
+// -----------------------------------------------------------------------------
+// P12e-1. Kinds of personal data per class (counted once, kept on each source point)
+MATCH (o:SourcePoint {app_id: $app, source_list: 'name_match'})
+WHERE o.target_name STARTS WITH 'get' AND NOT o.data_type CONTAINS '(key "'
+WITH o.target_class AS cls, collect(o) AS sps, count(DISTINCT split(o.data_type, ' (')[0]) AS getters
+UNWIND sps AS o
+SET o.class_personal_getters = getters
+RETURN count(DISTINCT cls) AS classes, count(o) AS source_points;
+
+// P12e-2. Evidence and confidence for each handles_personal_data reason
+MATCH (k:SourcePoint {app_id: $app, source_list: 'name_match'})
+WHERE k.data_type CONTAINS '(key "'
+WITH collect(DISTINCT split(k.data_type, ' (')[0]) AS keyed_kinds
+MATCH (g:PPG {app_id: $app})-[b:BECAUSE {reason: 'handles_personal_data'}]->(s:SourcePoint)
+MATCH (g)-[:FOR_METHOD]->(m:Method)
+WITH keyed_kinds, b, s, m, split(s.data_type, ' (')[0] AS kind, s.data_type CONTAINS '(key "' AS by_key
+CALL (m) {
+  OPTIONAL MATCH (m)-[:HAS_STATEMENT]->(k:SourcePoint {source_list: 'name_match'})
+  WHERE k.data_type CONTAINS '(key "'
+  RETURN count(DISTINCT split(k.data_type, ' (')[0]) AS keys
+}
+CALL (s) {
+  OPTIONAL MATCH (f:PrivacyFlow)-[:FROM]->(s) WHERE f.kind <> 'ui_display'
+  RETURN count(f) AS outflows
+}
+WITH b, [e IN [CASE WHEN coalesce(s.class_personal_getters, 0) >= 3 OR keys >= 3 THEN 'several_fields' END,
+               CASE WHEN outflows > 0 THEN 'reaches_sink' END,
+               CASE WHEN NOT by_key AND kind IN keyed_kinds THEN 'matching_key' END]
+         WHERE e IS NOT NULL] AS evidence
+SET b.evidence = evidence,
+    b.confidence = CASE WHEN 'several_fields' IN evidence THEN 'high' ELSE 'review' END
+RETURN b.confidence AS confidence, evidence, count(*) AS reasons
+ORDER BY confidence, reasons DESC;
+
+
+// -----------------------------------------------------------------------------
 // P13. Summary on each PPG (used by classification): why, which data, where it goes
 // -----------------------------------------------------------------------------
 MATCH (g:PPG {app_id: $app})-[:FOR_METHOD]->(m:Method)
@@ -509,7 +842,7 @@ SET g.method = m.class_name + '.' + m.name,
     g.permissions = permissions,
     g.sink_kinds = sink_kinds,
     g.confidence = CASE WHEN 'high' IN confs THEN 'high' ELSE 'review' END
-RETURN g.method AS method, g.categories AS categories, g.reasons AS reasons,
+RETURN g.method AS method, g.reasons AS reasons, g.reachable AS reachable,
        g.sink_kinds AS sinks, g.confidence AS confidence
 ORDER BY method;
 
@@ -522,10 +855,10 @@ MATCH (g:PPG {app_id: $app})-[:INCLUDES|FOR_METHOD|REACHES_SINK]->(n)
 WHERE NOT n:APG OR n.app_id <> $app
 RETURN count(*) AS foreign_nodes;
 
-// V2. Candidate PPGs left out because no entry point reaches them (review these by hand)
-MATCH (g:ExcludedPPG {app_id: $app})-[:FOR_METHOD]->(m)
+// V2. PPGs with no entry point found (kept; review whether a caller exists outside the build)
+MATCH (g:PPG {app_id: $app, reachable: false})-[:FOR_METHOD]->(m)
 OPTIONAL MATCH (g)-[b:BECAUSE]->()
-RETURN m.class_name + '.' + m.name AS method, collect(DISTINCT b.data_type) AS data, g.excluded_reason AS reason;
+RETURN m.class_name + '.' + m.name AS method, collect(DISTINCT b.data_type) AS data;
 
 // V3. Every consecutive pair on every flow's evidence path is joined by a real APG data edge
 MATCH (f:PrivacyFlow {app_id: $app})
@@ -547,22 +880,28 @@ RETURN count(g) AS ppgs_without_reason;
 // -----------------------------------------------------------------------------
 MATCH (a:App {app_id: $app})-[:HAS_PPG]->(g:PPG)-[:FOR_METHOD]->(m:Method)
 OPTIONAL MATCH (g)-[b:BECAUSE]->()
-WITH a, g, m, collect({reason: b.reason, category: b.category, data_type: b.data_type,
-                       detail: b.detail, confidence: b.confidence}) AS reasons
+WITH a, g, m, collect({reason: b.reason, detail: b.detail, source_list: b.source_list,
+                       confidence: b.confidence, evidence: b.evidence}) AS reasons,
+     [x IN collect(CASE WHEN b.reason IN ['asks_for_user_input', 'receives_user_input']
+                        THEN {reason: b.reason, component: b.detail, labels: b.input_labels,
+                              keyboard: b.input_keyboard, screen_strings: b.input_screen_strings} END)
+      WHERE x IS NOT NULL] AS input_fields
 OPTIONAL MATCH (g)-[:HAS_FLOW]->(f:PrivacyFlow)
-WITH a, g, m, reasons, collect(CASE WHEN f IS NULL THEN NULL ELSE
-       {data_type: f.data_type, sink_kind: f.kind, sink: f.api, sink_method: f.sink_method,
+WITH a, g, m, reasons, input_fields, collect(CASE WHEN f IS NULL THEN NULL ELSE
+       {source: f.source, sink_kind: f.kind, sink: f.api, sink_method: f.sink_method,
         through_methods: f.through_methods, confidence: f.confidence, evidence: f.evidence} END) AS flows
 OPTIONAL MATCH (g)-[c:GUARDED_BY_CONDITION]->()
-WITH a, g, m, reasons, flows, collect(CASE WHEN c IS NULL THEN NULL ELSE
+WITH a, g, m, reasons, input_fields, flows, collect(CASE WHEN c IS NULL THEN NULL ELSE
        {code: c.code, branch: c.branch, guards: c.guards, uses: c.uses_calls,
         permission_check: c.permission_check} END) AS conditions
 OPTIONAL MATCH (g)-[:CALLS_INTO]->(g2:PPG)
 OPTIONAL MATCH (g)-[:IN_SDK|SHARES_WITH]->(lib:Library)
 RETURN g.ppg_id AS ppg_id, a.package AS package,
        g.method AS method, g.method_signature AS signature, m.parameters AS parameters,
-       g.categories AS categories, g.data_types AS data_types, g.reasons AS reason_kinds,
-       reasons, g.permissions AS permissions, g.sink_kinds AS sink_kinds, g.confidence AS confidence,
+       g.reasons AS reason_kinds, g.reachable AS reachable,
+       {categories: g.categories, data_types: g.data_types,
+        note: 'from the source lists, NOT labels; do not train on these'} AS heuristic_hints,
+       reasons, input_fields, g.permissions AS permissions, g.sink_kinds AS sink_kinds, g.confidence AS confidence,
        g.entrypoint AS entrypoint, g.entrypoint_kind AS entrypoint_kind, g.call_chain AS call_chain,
        flows, conditions, collect(DISTINCT g2.method) AS calls_ppgs, collect(DISTINCT lib.name) AS sdks,
        m.source AS java, m.ast_table AS ast_table, m.cfg_table AS cfg_table,
