@@ -285,10 +285,11 @@ def writeHtml(path,appId,app,requested,labels,cssPath):
     legend+='<span><i class="sw" style="border:2px dashed var(--orange)"></i>Orange dashed: permission check</span>'
     legend+='<span><i class="sw" style="background:var(--blue)"></i>Blue: method name + description</span>'
     legend+='<span><i class="sw" style="background:var(--green)"></i>Green: variables the data flows into</span></div>'
-    ordered=sorted(labels,key=lambda l:(levelOrder.index(l["highest_level"]),l["method"] or ""))
     cards=""
-    for l in ordered:
-        cards+=card(l)
+    for level in levelOrder:
+        for l in labels:
+            if l["highest_level"]==level:
+                cards+=card(l)
     page='<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
     page+='<title>Annotated PPGs</title><style>'+css+'</style></head><body><main>'
     page+='<h1>Annotated Privacy Property Graphs</h1><div class="muted">Code segments marked up per the 11/18 meeting notes. '
